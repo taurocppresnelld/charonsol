@@ -9,6 +9,8 @@
     "check": "node --check index.js && node --check src/app.js && node --check src/config.js",
     "cli": "node scripts/cli.js",
     "test-cycle": "node scripts/test-cycle.js",
+    "migrate:il": "node scripts/migrate-il-tracking.js",
+    "backfill:il": "node scripts/backfill-il.js",    
     "positions": "node scripts/list-positions.js",
     "lp-candidates": "node scripts/cli.js lp-candidates",
     "lp-sim": "node scripts/cli.js lp-sim",

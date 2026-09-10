@@ -1,18 +1,22 @@
 #!/usr/bin/env node
-// ── Charonsol backtest ──────────────────────────────────────────────────────────────
+// ── Charonsol backtest (Updated with Score Column, IL, Side-by-Side & Route Breakdown) ──
 import { initDb, db } from '../src/db/connection.js';
 import { safeJson } from '../src/utils.js';
 
 initDb();
 
 const SORT_KEY_LABELS = {
-  yield_delta: 'ΔYield% (default)',
+  score: 'Filter Score (Composite Rank, default)',
+  net_pnl_delta: 'ΔNetPnL% (Fees + IL)',
+  net_pnl: 'raw avgNetPnL%',
+  yield_delta: 'ΔYield% (Fee Yield only)',
   yield: 'raw avgYield%',
+  il_delta: 'ΔIL% (Impermanent Loss delta)',
   nonzero: 'nonZero% (fraction that earned any fee)',
-  tvl_drained_delta: 'ΔtvlDrained% (ascending — a filter that REDUCES this ranks first)',
+  tvl_drained_delta: 'ΔtvlDrained% (ascending — lower is better)',
   n: 'raw N',
   pct_keep: '% of baseline kept',
-  yield_tvl_ratio: 'avgYield% per tvlDrained% point — risk-adjusted efficiency, higher is better',
+  yield_tvl_ratio: 'avgYield% per tvlDrained% point',
 };
 
 function parseArgs(argv) {
@@ -42,14 +46,12 @@ function parseArgs(argv) {
 
   const comboIdx = argv.indexOf('--combo-size');
   const comboSize = comboIdx !== -1 ? Number(argv[comboIdx + 1]) : 2;
-  if (!Number.isFinite(comboSize) || comboSize < 2) {
-    if (!isJson) console.log(`--combo-size must be at least 2, got ${argv[comboIdx + 1]}`);
-    process.exit(1);
-  }
 
   const sortIdx = argv.indexOf('--sort-by');
-  const sortBy = sortIdx !== -1 ? argv[sortIdx + 1].split(',').map(s => s.trim()).filter(Boolean) : ['yield_delta'];
-  
+  const sortBy = sortIdx !== -1 
+    ? argv[sortIdx + 1].split(',').map(s => s.trim()).filter(Boolean) 
+    : ['score'];
+
   const topIdx = argv.indexOf('--top');
   const top = topIdx !== -1 ? Number(argv[topIdx + 1]) : null;
 
@@ -72,15 +74,25 @@ function extract(row) {
 
   const notional = row.notional_usd || 0;
   const realizedFee = row.realized_fee_usd ?? 0;
+  const ilUsd = row.il_usd ?? 0;
+  const netPnlUsd = row.net_pnl_usd ?? (realizedFee + ilUsd);
+
   const yieldPct = notional > 0 ? (realizedFee / notional) * 100 : 0;
+  const ilPct = notional > 0 ? (ilUsd / notional) * 100 : 0;
+  const netPnlPct = notional > 0 ? (netPnlUsd / notional) * 100 : 0;
+
   const holdMs = row.hold_ms || 0;
   const holdDays = holdMs / (24 * 60 * 60 * 1000);
   const annualizedYieldPct = holdMs >= 60 * 60 * 1000 ? yieldPct * (365 / holdDays) : null;
 
   return {
     yield_pct: yieldPct,
+    il_pct: ilPct,
+    net_pnl_pct: netPnlPct,
     annualized_yield_pct: annualizedYieldPct,
     realized_fee_usd: realizedFee,
+    il_usd: ilUsd,
+    net_pnl_usd: netPnlUsd,
     close_reason: row.close_reason || '',
     hold_min: holdMs / 60_000,
     route,
@@ -110,23 +122,44 @@ function analyze(subset) {
   if (n === 0) return null;
   const nonZero = subset.filter(d => d.realized_fee_usd > 1e-6).length;
   const avgYieldPct = subset.reduce((s, d) => s + d.yield_pct, 0) / n;
+  const avgIlPct = subset.reduce((s, d) => s + d.il_pct, 0) / n;
+  const avgNetPnlPct = subset.reduce((s, d) => s + d.net_pnl_pct, 0) / n;
+
   const annualizable = subset.filter(d => d.annualized_yield_pct != null);
   const avgAnnualizedYieldPct = annualizable.length
     ? annualizable.reduce((s, d) => s + d.annualized_yield_pct, 0) / annualizable.length
     : null;
+
   const avgHoldMin = subset.reduce((s, d) => s + d.hold_min, 0) / n;
   const tvlDrainedPct = subset.filter(d => d.close_reason === 'tvl_drained').length / n * 100;
-  const feeStallPct = subset.filter(d => d.close_reason === 'fee_stall').length / n * 100;
-  const maxHoldPct = subset.filter(d => d.close_reason === 'max_hold').length / n * 100;
   const yieldPerTvlDrain = tvlDrainedPct > 0 ? avgYieldPct / tvlDrainedPct : (avgYieldPct > 0 ? Infinity : 0);
-  return { n, nAnnualizable: annualizable.length, nonZeroPct: nonZero / n * 100, avgYieldPct, avgAnnualizedYieldPct, avgHoldMin, tvlDrainedPct, feeStallPct, maxHoldPct, yieldPerTvlDrain };
+
+  return { 
+    n, 
+    nAnnualizable: annualizable.length, 
+    nonZeroPct: nonZero / n * 100, 
+    avgYieldPct, 
+    avgIlPct, 
+    avgNetPnlPct, 
+    avgAnnualizedYieldPct, 
+    avgHoldMin, 
+    tvlDrainedPct, 
+    yieldPerTvlDrain 
+  };
 }
 
-const fmtRatio = (v) => v === Infinity ? '∞' : v.toFixed(2);
+function computeScore(r, baseline) {
+  const netPnlDelta = r.avgNetPnlPct - baseline.avgNetPnlPct;
+  const pctKeep = (r.n / baseline.n) * 100;
+  const samplePenalty = r.n < 30 ? 10 * (1 - (r.n / 30)) : 0;
+  const score = (netPnlDelta * 0.6) + (pctKeep * 0.05) - samplePenalty;
+  return Number(score.toFixed(3));
+}
+
 const fmtApy = (v) => v == null ? 'n/a' : `${v.toFixed(1)}%`;
 
 const POOL_FILTERS = [
-  ['degen_score', 'pool-mix', d => ((d.bin_step >= 90) && (d.entry_fee_active_tvl_ratio >= 1.0) && (d.entry_volume_window >= 100_000)) || ((d.bin_step >= 90) && (d.pools_found >= 2) && (d.entry_volume_window >= 100_000)) || ((d.entry_fee_active_tvl_ratio >= 1.0) && (d.pools_found >= 2) && (d.entry_volume_window >= 100_000)) || ((d.bin_step >= 90) && (d.entry_fee_active_tvl_ratio >= 1.0) && (d.pools_found >= 2))],
+  ['mix', 'pool-mix', d => ((d.bin_step >= 90) && (d.entry_fee_active_tvl_ratio >= 1.0) && (d.entry_volume_window >= 100_000)) || ((d.bin_step >= 90) && (d.pools_found >= 2) && (d.entry_volume_window >= 100_000)) || ((d.entry_fee_active_tvl_ratio >= 1.0) && (d.pools_found >= 2) && (d.entry_volume_window >= 100_000)) || ((d.bin_step >= 90) && (d.entry_fee_active_tvl_ratio >= 1.0) && (d.pools_found >= 2))],
   ['degen_score', 'degen_score >= 15', d => d.degen_score >= 15],
   ['degen_score', 'degen_score >= 30', d => d.degen_score >= 30],
   ['degen_score', 'degen_score >= 50', d => d.degen_score >= 50],
@@ -157,7 +190,7 @@ const POOL_FILTERS = [
 ];
 
 const TOKEN_FILTERS = [
-  ['mcap', 'token-mix', d => ((d.ja_bondingCurve >= 60) && (d.ho_count >= 50) && (d.ja_mcap <= 5_000_000)) || ((d.ja_bondingCurve >= 60) && (d.ja_mcap <= 5_000_000) && (d.ja_organicScore >= 70)) || ((d.ja_bondingCurve >= 60) && (d.me_liquidityUsd >= 20_000) && (d.ja_mcap <= 5_000_000)) || ((d.me_liquidityUsd >= 20_000) && (d.ja_mcap <= 5_000_000) && (d.ja_organicScore >= 70)) || ((d.ho_count >= 50) && (d.ja_mcap <= 5_000_000) && (d.ja_organicScore >= 70)) || ((d.ja_bondingCurve >= 60) && (d.ho_count >= 50) && (d.me_liquidityUsd >= 20_000)) || ((d.ja_bondingCurve >= 60) && (d.me_liquidityUsd >= 20_000) && (d.ja_organicScore >= 70)) || ((d.ja_bondingCurve >= 60) && (d.ho_count >= 50) && (d.ja_organicScore >= 70)) || ((d.ho_count >= 50) && (d.me_liquidityUsd >= 20_000) && (d.ja_mcap <= 5_000_000)) || ((d.ho_count >= 50) && (d.me_liquidityUsd >= 20_000) && (d.ja_organicScore >= 70))],
+  ['mix', 'token-mix', d => ((d.me_liquidityUsd >= 20_000) && (d.ho_maxHolderPercent < 20) && (d.ja_organicScore >= 70)) || ((d.me_liquidityUsd >= 20_000) && (d.ho_maxHolderPercent < 20) && (d.ja_mcap <= 5_000_000)) || ((d.me_liquidityUsd >= 20_000) && (d.ja_mcap <= 5_000_000) && (d.ja_organicScore >= 70)) || ((d.ho_maxHolderPercent < 20) && (d.ja_mcap <= 5_000_000) && (d.ja_organicScore >= 70)) || ((d.ho_count >= 50) && (d.me_liquidityUsd >= 20_000) && (d.ho_maxHolderPercent < 20)) || ((d.ho_count >= 50) && (d.me_liquidityUsd >= 20_000) && (d.ja_mcap <= 5_000_000)) || ((d.ja_bondingCurve >= 60) && (d.me_liquidityUsd >= 20_000) && (d.ja_mcap <= 5_000_000)) || ((d.ho_count >= 50) && (d.me_liquidityUsd >= 20_000) && (d.ja_organicScore >= 70)) || ((d.ho_count >= 50) && (d.ho_maxHolderPercent < 20) && (d.ja_organicScore >= 70)) || ((d.ja_bondingCurve >= 60) && (d.ja_mcap <= 5_000_000) && (d.ja_organicScore >= 70)) || ((d.ja_bondingCurve >= 60) && (d.ho_count >= 50) && (d.ja_mcap <= 5_000_000)) || ((d.ho_count >= 50) && (d.ho_maxHolderPercent < 20) && (d.ja_mcap <= 5_000_000)) || ((d.ho_count >= 50) && (d.ja_mcap <= 5_000_000) && (d.ja_organicScore >= 70)) || ((d.ja_bondingCurve >= 60) && (d.ho_maxHolderPercent < 20) && (d.ja_mcap <= 5_000_000)) || ((d.ja_bondingCurve >= 60) && (d.me_liquidityUsd >= 20_000) && (d.ja_organicScore >= 70)) || ((d.ja_bondingCurve >= 60) && (d.ho_count >= 50) && (d.me_liquidityUsd >= 20_000)) || ((d.ja_bondingCurve >= 60) && (d.me_liquidityUsd >= 20_000) && (d.ho_maxHolderPercent < 20)) || ((d.ja_bondingCurve >= 60) && (d.ho_maxHolderPercent < 20) && (d.ja_organicScore >= 70)) || ((d.ja_bondingCurve >= 60) && (d.ho_count >= 50) && (d.ja_organicScore >= 70)) || ((d.ja_bondingCurve >= 60) && (d.ho_count >= 50) && (d.ho_maxHolderPercent < 20))],
   ['mcap', 'mcap < 100K', d => d.ja_mcap <= 100_000],
   ['mcap', 'mcap < 250K', d => d.ja_mcap <= 250_000],
   ['mcap', 'mcap < 500K', d => d.ja_mcap <= 500_000],
@@ -202,8 +235,12 @@ const ROUTE_FILTERS = [
 const ASCENDING_SORT_KEYS = new Set(['tvl_drained_delta']);
 function sortKeyFns(baseline) {
   return {
+    score: r => r.score,
+    net_pnl_delta: r => r.netPnlDelta,
+    net_pnl: r => r.avgNetPnlPct,
     yield_delta: r => r.yieldDelta,
     yield: r => r.avgYieldPct,
+    il_delta: r => r.ilDelta,
     nonzero: r => r.nonZeroPct,
     tvl_drained_delta: r => r.tvlDrainedPct - baseline.tvlDrainedPct,
     n: r => r.n,
@@ -233,27 +270,50 @@ function rankSingles(filterList, data, baseline, sortBy) {
     const subset = data.filter(fn);
     const r = analyze(subset);
     if (!r) return null;
-    const apyDelta = (r.avgAnnualizedYieldPct != null && baseline.avgAnnualizedYieldPct != null)
-      ? r.avgAnnualizedYieldPct - baseline.avgAnnualizedYieldPct
-      : null;
-    return { category, label, fn, ...r, yieldDelta: r.avgYieldPct - baseline.avgYieldPct, apyDelta, pctKeep: r.n / baseline.n * 100 };
+    const res = { 
+      category, 
+      label, 
+      fn, 
+      ...r, 
+      netPnlDelta: r.avgNetPnlPct - baseline.avgNetPnlPct,
+      yieldDelta: r.avgYieldPct - baseline.avgYieldPct, 
+      ilDelta: r.avgIlPct - baseline.avgIlPct,
+      pctKeep: r.n / baseline.n * 100 
+    };
+    res.score = computeScore(res, baseline);
+    return res;
   }).filter(Boolean);
   sortResults(results, sortBy, baseline);
   return results;
 }
 
-function generateCombos(filterList, comboSize, data, baseline, sortBy, groupLabel, minN, comboOp = 'BOTH', isJson = false) {
+function printSingles(title, results, sortBy, top) {
+  const limit = top ?? 30;
+  console.log(`\n=== ${title} ===`);
+  console.log(`Sorted by: ${sortBy.map(k => `${k} (${SORT_KEY_LABELS[k]})`).join(', then ')}`);
+  console.log(
+    `${'Filter'.padEnd(36)} | ${'Score'.padStart(6)} | ${'N'.padStart(4)} | ${'nonZero%'.padStart(8)} | ` +
+    `${'avgNetPnL%'.padStart(10)} | ${'ΔNetPnL%'.padStart(9)} | ${'avgYield%'.padStart(9)} | ${'%keep'.padStart(5)}`
+  );
+  console.log('-'.repeat(110));
+  for (const r of results.slice(0, limit)) {
+    console.log(
+      `${r.label.padEnd(36)} | ${r.score.toFixed(3).padStart(6)} | ${String(r.n).padStart(4)} | ${r.nonZeroPct.toFixed(1).padStart(7)}% | ` +
+      `${r.avgNetPnlPct.toFixed(3).padStart(9)}% | ` +
+      `${(r.netPnlDelta >= 0 ? '+' : '') + r.netPnlDelta.toFixed(3)}%`.padStart(10) + ` | ` +
+      `${r.avgYieldPct.toFixed(3).padStart(8)}% | ${r.pctKeep.toFixed(0).padStart(4)}%`
+    );
+  }
+}
+
+function generateCombos(filterList, comboSize, data, baseline, sortBy, groupLabel, minN, comboOp = 'BOTH') {
   const byCategory = new Map();
   for (const [category, label, fn] of filterList) {
     if (!byCategory.has(category)) byCategory.set(category, []);
     byCategory.get(category).push([label, fn]);
   }
   const categories = Array.from(byCategory.keys()).sort();
-
-  if (comboSize > categories.length) {
-    if (!isJson) console.log(`Skipping ${groupLabel} combo analysis.`);
-    return [];
-  }
+  if (comboSize > categories.length) return [];
 
   const opDefs = {
     AND: fns => d => fns.every(f => f(d)),
@@ -273,11 +333,19 @@ function generateCombos(filterList, comboSize, data, baseline, sortBy, groupLabe
         const subset = data.filter(combine);
         const r = analyze(subset);
         if (!r || (minN != null && r.n < minN)) continue;
-        const apyDelta = (r.avgAnnualizedYieldPct != null && baseline.avgAnnualizedYieldPct != null)
-          ? r.avgAnnualizedYieldPct - baseline.avgAnnualizedYieldPct
-          : null;
         const label = labels.map(l => `(${l})`).join(` ${opName} `);
-        comboResults.push({ label, fn: combine, op: opName, ...r, yieldDelta: r.avgYieldPct - baseline.avgYieldPct, apyDelta, pctKeep: r.n / baseline.n * 100 });
+        const res = { 
+          label, 
+          fn: combine, 
+          op: opName, 
+          ...r, 
+          netPnlDelta: r.avgNetPnlPct - baseline.avgNetPnlPct,
+          yieldDelta: r.avgYieldPct - baseline.avgYieldPct, 
+          ilDelta: r.avgIlPct - baseline.avgIlPct,
+          pctKeep: r.n / baseline.n * 100 
+        };
+        res.score = computeScore(res, baseline);
+        comboResults.push(res);
       }
     }
   }
@@ -298,42 +366,61 @@ function cartesianProduct(arrays) {
   return arrays.reduce((acc, arr) => acc.flatMap(a => arr.map(b => [...a, b])), [[]]);
 }
 
-function printSingles(title, results, sortBy, top) {
-  const limit = top ?? 30;
-  console.log(`\n=== ${title} ===`);
+function printCombos(title, comboResults, comboSize, sortBy, top) {
+  const limit = top ?? 20;
+  console.log(`\n=== TOP ${comboSize}-FILTER COMBOS: ${title} — ${comboResults.length} combo(s) ===`);
   console.log(`Sorted by: ${sortBy.map(k => `${k} (${SORT_KEY_LABELS[k]})`).join(', then ')}`);
   console.log(
-    `${'Filter'.padEnd(42)} | ${'N'.padStart(4)} | ${'nonZero%'.padStart(8)} | ${'avgYield%'.padStart(9)} | ` +
-    `${'ΔYield%'.padStart(8)} | ${'avgAPY%'.padStart(8)} | ${'tvlDrn%'.padStart(7)} | ${'yield/tvlDrn'.padStart(12)} | ${'%keep'.padStart(5)}`,
+    `${'Combo'.padEnd(64)} | ${'Score'.padStart(6)} | ${'N'.padStart(4)} | ${'nonZero%'.padStart(8)} | ` +
+    `${'avgNetPnL%'.padStart(10)} | ${'ΔNetPnL%'.padStart(9)} | ${'avgYield%'.padStart(9)} | ${'%keep'.padStart(5)}`
   );
-  console.log('-'.repeat(134));
-  for (const r of results.slice(0, limit)) {
+  console.log('-'.repeat(138));
+  for (const r of comboResults.slice(0, limit)) {
     console.log(
-      `${r.label.padEnd(42)} | ${String(r.n).padStart(4)} | ${r.nonZeroPct.toFixed(1).padStart(7)}% | ` +
-      `${r.avgYieldPct.toFixed(3).padStart(8)}% | ` +
-      `${(r.yieldDelta >= 0 ? '+' : '') + r.yieldDelta.toFixed(3)}%`.padStart(9) + ` | ` +
-      `${fmtApy(r.avgAnnualizedYieldPct).padStart(7)} | ${r.tvlDrainedPct.toFixed(0).padStart(6)}% | ${fmtRatio(r.yieldPerTvlDrain).padStart(12)} | ${r.pctKeep.toFixed(0).padStart(4)}%`,
+      `${r.label.padEnd(64)} | ${r.score.toFixed(3).padStart(6)} | ${String(r.n).padStart(4)} | ${r.nonZeroPct.toFixed(1).padStart(7)}% | ` +
+      `${r.avgNetPnlPct.toFixed(3).padStart(9)}% | ` +
+      `${(r.netPnlDelta >= 0 ? '+' : '') + r.netPnlDelta.toFixed(3)}%`.padStart(10) + ` | ` +
+      `${r.avgYieldPct.toFixed(3).padStart(8)}% | ${r.pctKeep.toFixed(0).padStart(4)}%`
     );
   }
 }
 
-function printCombos(title, comboResults, comboSize, sortBy, top) {
-  const limit = top ?? 20;
-  console.log(`\n=== TOP ${comboSize}-FILTER COMBOS: ${title} (AND/OR, cross-category only) — ${comboResults.length} combo(s) with data ===`);
-  console.log(`Sorted by: ${sortBy.map(k => `${k} (${SORT_KEY_LABELS[k]})`).join(', then ')}`);
-  console.log(
-    `${'Combo'.padEnd(70)} | ${'N'.padStart(4)} | ${'nonZero%'.padStart(8)} | ${'avgYield%'.padStart(9)} | ` +
-    `${'ΔYield%'.padStart(8)} | ${'avgAPY%'.padStart(8)} | ${'tvlDrn%'.padStart(7)} | ${'yield/tvlDrn'.padStart(12)} | ${'%keep'.padStart(5)}`,
-  );
-  console.log('-'.repeat(159));
-  for (const r of comboResults.slice(0, limit)) {
-    console.log(
-      `${r.label.padEnd(70)} | ${String(r.n).padStart(4)} | ${r.nonZeroPct.toFixed(1).padStart(7)}% | ` +
-      `${r.avgYieldPct.toFixed(3).padStart(8)}% | ` +
-      `${(r.yieldDelta >= 0 ? '+' : '') + r.yieldDelta.toFixed(3)}%`.padStart(9) + ` | ` +
-      `${fmtApy(r.avgAnnualizedYieldPct).padStart(7)} | ${r.tvlDrainedPct.toFixed(0).padStart(6)}% | ${fmtRatio(r.yieldPerTvlDrain).padStart(12)} | ${r.pctKeep.toFixed(0).padStart(4)}%`,
-    );
+function printSideBySide(groupLabel, singles, combos, sortByList, baseline) {
+  if (!singles.length || !combos.length) return;
+  const s = singles[0];
+  const c = combos[0];
+  const comboBetter = compareByKeys(c, s, sortByList, baseline) < 0;
+  const primaryFn = sortKeyFns(baseline)[sortByList[0]];
+  const sVal = primaryFn(s), cVal = primaryFn(c);
+  const fmtVal = (v) => v === Infinity ? '∞' : v.toFixed(3);
+  const sortLabel = sortByList.join(', ');
+  console.log(`\n=== SIDE-BY-SIDE (${groupLabel}): top single filter vs. top combo, sorted by ${sortLabel} ===`);
+  console.log(`  Top SINGLE : ${s.label.padEnd(42)} | Score ${s.score.toFixed(3)} | ΔNetPnL% ${(s.netPnlDelta >= 0 ? '+' : '') + s.netPnlDelta.toFixed(3)} | n=${s.n} (${s.pctKeep.toFixed(0)}% kept)`);
+  console.log(`  Top COMBO  : ${c.label.padEnd(70)} | Score ${c.score.toFixed(3)} | ΔNetPnL% ${(c.netPnlDelta >= 0 ? '+' : '') + c.netPnlDelta.toFixed(3)} | n=${c.n} (${c.pctKeep.toFixed(0)}% kept)`);
+  if (comboBetter) {
+    console.log(`  -> The top combo ranks ahead of the top single filter on ${sortLabel} (primary key ${sortByList[0]}: ${fmtVal(cVal)} vs ${fmtVal(sVal)}).`);
+  } else {
+    console.log(`  -> The top single filter still ranks ahead of every ${groupLabel} combo tested on ${sortLabel}`);
+    console.log(`     (primary key ${sortByList[0]}: ${fmtVal(sVal)} vs ${fmtVal(cVal)}) — combining signals didn't find anything better than`);
+    console.log(`     acting on the strongest one alone here.`);
   }
+}
+
+function printRouteBreakdown(label, fn, data) {
+  const subset = data.filter(fn);
+  const byRoute = new Map();
+  for (const d of subset) {
+    if (!byRoute.has(d.route)) byRoute.set(d.route, []);
+    byRoute.get(d.route).push(d);
+  }
+  const top = analyze(subset);
+  console.log(`\n  [${label}] — ${top.n} positions, ${top.avgNetPnlPct.toFixed(3)}% avg Net PnL (${top.avgYieldPct.toFixed(3)}% yield, ${fmtApy(top.avgAnnualizedYieldPct)} APY, n=${top.nAnnualizable})`);
+  Array.from(byRoute.entries())
+    .map(([route, ds]) => [route, analyze(ds)])
+    .sort((a, b) => b[1].avgNetPnlPct - a[1].avgNetPnlPct)
+    .forEach(([route, r]) => {
+      console.log(`    ${route.padEnd(28)} | ${String(r.n).padStart(4)} positions | ${r.avgNetPnlPct.toFixed(3).padStart(7)}% avg Net PnL | ${r.avgYieldPct.toFixed(3).padStart(7)}% yield | ${fmtApy(r.avgAnnualizedYieldPct)} APY`);
+    });
 }
 
 function main() {
@@ -342,7 +429,8 @@ function main() {
   const timeClause = sinceMs != null ? 'AND s.closed_at_ms >= ?' : '';
   const params = sinceMs != null ? [sinceMs] : [];
   const rows = db.prepare(`
-    SELECT s.notional_usd, s.realized_fee_usd, s.close_reason, s.hold_ms,
+    SELECT s.notional_usd, s.realized_fee_usd, s.il_usd, s.net_pnl_usd,
+           s.close_reason, s.hold_ms,
            s.entry_degen_score, s.entry_fee_active_tvl_ratio, s.entry_active_tvl,
            s.entry_volume_window, s.bin_step,
            lc.pools_found,
@@ -355,13 +443,9 @@ function main() {
   `).all(...params);
 
   const data = rows.map(extract);
-
   if (data.length < 10) {
-    if (isJson) {
-      console.log(JSON.stringify({ error: "Insufficient positions", count: data.length }));
-    } else {
-      console.log(`Only ${data.length} closed position(s) — need at least 10 for a meaningful backtest.`);
-    }
+    if (isJson) console.log(JSON.stringify({ error: "Insufficient positions", count: data.length }));
+    else console.log(`Only ${data.length} closed position(s) — need at least 10 for backtesting.`);
     process.exit(0);
   }
 
@@ -371,13 +455,14 @@ function main() {
   const tokenSingles = rankSingles(TOKEN_FILTERS, data, baseline, sortBy);
   const routeSingles = rankSingles(ROUTE_FILTERS, data, baseline, sortBy);
 
-  const poolCombos = generateCombos(POOL_FILTERS, comboSize, data, baseline, sortBy, 'POOL-LEVEL', minN, comboOp, isJson);
-  const tokenCombos = generateCombos(TOKEN_FILTERS, comboSize, data, baseline, sortBy, 'TOKEN-LEVEL', minN, comboOp, isJson);
+  const poolCombos = generateCombos(POOL_FILTERS, comboSize, data, baseline, sortBy, 'POOL-LEVEL', minN, comboOp);
+  const tokenCombos = generateCombos(TOKEN_FILTERS, comboSize, data, baseline, sortBy, 'TOKEN-LEVEL', minN, comboOp);
 
   if (isJson) {
     const stripFn = (list) => list.map(({ fn, ...rest }) => ({
       ...rest,
-      pnl: rest.yieldDelta // PnL mapped from yieldDelta for LLM compatibility
+      pnl: rest.netPnlDelta,
+      score: rest.score
     }));
 
     console.log(JSON.stringify({
@@ -388,11 +473,21 @@ function main() {
       topCombosTokenLevel: stripFn(tokenCombos)
     }, null, 2));
   } else {
+    console.log(`\nBASELINE: ${baseline.n} pos | Net PnL: ${baseline.avgNetPnlPct.toFixed(2)}% | Fee Yield: ${baseline.avgYieldPct.toFixed(2)}% | IL: ${baseline.avgIlPct.toFixed(2)}%`);
+
     printSingles('POOL-LEVEL FILTERS', poolSingles, sortBy, top);
     printSingles('TOKEN-LEVEL FILTERS', tokenSingles, sortBy, top);
     printSingles('BY SOURCE', routeSingles, sortBy, top);
+
     printCombos('POOL-LEVEL', poolCombos, comboSize, sortBy, top);
     printCombos('TOKEN-LEVEL', tokenCombos, comboSize, sortBy, top);
+
+    printSideBySide('POOL-LEVEL', poolSingles, poolCombos, sortBy, baseline);
+    printSideBySide('TOKEN-LEVEL', tokenSingles, tokenCombos, sortBy, baseline);
+
+    console.log(`\n--- Per-route breakdown of the top single-filter pick in each group ---`);
+    if (poolSingles[0]) printRouteBreakdown(`POOL: ${poolSingles[0].label}`, poolSingles[0].fn, data);
+    if (tokenSingles[0]) printRouteBreakdown(`TOKEN: ${tokenSingles[0].label}`, tokenSingles[0].fn, data);
   }
 }
 

@@ -123,14 +123,14 @@ function run() {
     const topComboPoolFilters = (data.topCombosPoolLevel || [])
       .filter(c => c.pnl > 0 && comboHasAllMembers(c.label, topPoolFilters))
       .sort((a, b) => {
-        if (b.pnl !== a.pnl) return b.pnl - a.pnl;
+        if (b.score !== a.score) return b.score - a.score;
         return b.n - a.n;
       });
 
     const topComboTokenFilters = (data.topCombosTokenLevel || [])
       .filter(c => c.pnl > 0 && comboHasAllMembers(c.label, topTokenFilters))
       .sort((a, b) => {
-        if (b.pnl !== a.pnl) return b.pnl - a.pnl;
+        if (b.score !== a.score) return b.score - a.score;
         return b.n - a.n;
       });
 

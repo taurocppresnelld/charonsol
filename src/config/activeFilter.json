@@ -1,0 +1,9 @@
+{
+  "updatedAt": "2026-09-10T11:34:37.226Z",
+  "filterLabel": "(a_tvl 50K) AND (vol_window >= 100K)",
+  "filterType": "Pool Combo",
+  "score": 7.487,
+  "sampleSize": 160,
+  "netPnlDeltaPct": 11.593263254159535,
+  "jsExpression": "(candidate.activeTvl <= 50000) && (candidate.volumeWindow >= 100000)"
+}
