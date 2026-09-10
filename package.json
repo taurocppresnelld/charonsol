@@ -1,0 +1,40 @@
+{
+  "name": "charonsol",
+  "version": "0.1.0",
+  "type": "module",
+  "private": true,
+  "description": "Charon token screening + Meridian Meteora DLMM pool screening...",
+  "scripts": {
+    "start": "node index.js",
+    "check": "node --check index.js && node --check src/app.js && node --check src/config.js",
+    "cli": "node scripts/cli.js",
+    "test-cycle": "node scripts/test-cycle.js",
+    "positions": "node scripts/list-positions.js",
+    "lp-candidates": "node scripts/cli.js lp-candidates",
+    "lp-sim": "node scripts/cli.js lp-sim",
+    "lp-sim-report": "node scripts/cli.js lp-sim-report",
+    "filter-report": "node scripts/cli.js filter-report",
+    "backtest": "node scripts/backtest.js",
+    "backtest:llm": "node scripts/run-and-filter.js",
+    "stats": "node scripts/cli.js stats",
+    "events": "node scripts/cli.js events",
+    "setting": "node scripts/cli.js setting",
+    "unset": "node scripts/cli.js unset",
+    "stratshow": "node scripts/cli.js stratshow",
+    "stratset": "node scripts/cli.js stratset",
+    "reset": "node scripts/cli.js reset",
+    "queue-status": "node scripts/cli.js queue-status",
+    "dbsize": "node scripts/cli.js dbsize",
+    "prune": "node scripts/cli.js prune",
+    "vacuum": "node scripts/cli.js vacuum"
+  },
+  "dependencies": {
+    "axios": "^1.7.9",
+    "better-sqlite3": "^12.9.0",
+    "dotenv": "^16.4.7",
+    "ws": "^8.18.0"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
